@@ -61,7 +61,6 @@ print(device)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 model = YOLO('yolov8s-pose.pt')  # load a pretrained YOLOv8n classification model
-model.to(device)
 video_path = r"D:\videos\stul.mp4"
 cap = cv2.VideoCapture(video_path)
 # Get video properties
@@ -216,7 +215,7 @@ while cap.isOpened():
     success, frame = cap.read()
     if success:
         frame = cv2.resize(frame,(1280,704))
-        results = model.track(frame, persist=True, retina_masks=True, boxes=True, show_conf=False, line_width=1,  conf=0.3, iou=0.5,  classes=0, show_labels=False, device=device,verbose = True,tracker="bytetrack.yaml")
+        results = model.predict(frame, persist=True, retina_masks=True, boxes=True, show_conf=False, line_width=1,  conf=0.3, iou=0.5,  classes=0, show_labels=False, device=device,verbose = True,tracker="bytetrack.yaml")
         boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
         if results[0].boxes.id is not None:
             ids = results[0].boxes.id.cpu().numpy().astype(int)
