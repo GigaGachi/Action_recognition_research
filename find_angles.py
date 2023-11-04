@@ -1,9 +1,7 @@
 from ultralytics import YOLO
-from pydantic import BaseModel
 import cv2
 import torch
 import os
-import time
 import numpy as np
 import math
 from collections import deque
@@ -55,14 +53,13 @@ connections = [
     ('RIGHT_KNEE', 'RIGHT_ANKLE', hips_and_feet_color),
 ]
 
-#device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-device  = torch.device('cpu')
-print(device)
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-model = YOLO('yolov8s-pose.pt')  # load a pretrained YOLOv8n classification model
+model = YOLO('yolov8l-pose.pt')  # load a pretrained YOLOv8n classification model
 video_path = r"D:\videos\stul.mp4"
-cap = cv2.VideoCapture(video_path)
+#cap = cv2.VideoCapture(video_path)
+cap = cv2.VideoCapture(0)
 # Get video properties
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -93,28 +90,6 @@ def extract_keypoints(results, threshold_class):
         existing_kp[int(i_d)] = keyp_arr
     return existing_kp
 
-def calc_kp_to_kp_dist(keypoints_dict):
-    # creating a dictionary of distances between each keypoint (except of the same object) in the keypoint_dict
-    dist_dict = {}
-    num_obj = len(keypoints_dict.keys())
-    keys = keypoints_dict.keys()
-    # calculating distances between keypoints 
-    for l,keyi in enumerate(keys,start =1):
-        for m,keyj in enumerate(keys,start =1):
-            if m>=l:
-                break  
-            for i,p1 in enumerate(keypoints_dict[keyi]):
-                for j,p2 in enumerate(keypoints_dict[keyj]):
-                    dist = calc_euclid_dist(p1,p2)
-                    dist_dict[f'{keyi}'+f'{keyj}'+f'{i}'+f'{j}'] = dist
-    return dist_dict
-
-def calc_euclid_dist(p1,p2):
-    if (len(p1)>0) and (len(p2)>0):
-        dist = int(np.linalg.norm(p1-p2,ord = 2))
-        return dist
-    else: 
-        return None
     
 def calc_angle(v1,v2):
     if (len(v1)>0) and (len(v2)>0):
@@ -123,7 +98,47 @@ def calc_angle(v1,v2):
     else: 
         return None
 
-def calc_angles(keypoints_dict,kp_conf):
+def calc_angles_upper_body(keypoints_dict,kp_conf):
+    #angles dictionary to store angles between doby and legs of each object
+    angles_dic = {}
+    for key in keypoints_dict:
+        #extracting keypoints
+        left_hip = keypoints_dict[key][11]
+        if left_hip[2] < kp_conf:
+            angles_dic[f'{key}'] = [180,180]
+            continue
+        right_hip = keypoints_dict[key][12]
+        if right_hip[2] < kp_conf:
+            angles_dic[f'{key}'] = [180,180]
+            continue
+        left_elbow = keypoints_dict[key][7]
+        if left_elbow[2] < kp_conf:
+            angles_dic[f'{key}'] = [180,180]
+            continue
+        right_elbow = keypoints_dict[key][8]
+        if right_elbow[2] < kp_conf:
+            angles_dic[f'{key}'] = [180,180]
+            continue
+        left_shoulder = keypoints_dict[key][5]
+        if left_shoulder[2] < kp_conf:
+            angles_dic[f'{key}'] = [180,180]
+            continue
+        right_shoulder = keypoints_dict[key][6]
+        if right_shoulder[2] < kp_conf:
+            angles_dic[f'{key}'] = [180,180]
+            continue
+        #calculating vectors between keypoints
+        vl1 = [left_shoulder[0]-left_elbow[0],left_shoulder[1]-left_elbow[1]]
+        vl2 = [left_hip[0] - left_shoulder[0], left_hip[1] -left_shoulder[1] ]
+        vr1 = [right_shoulder[0]-right_elbow[0],right_shoulder[1]-right_elbow[1]]
+        vr2 = [right_hip[0] - right_shoulder[0], right_hip[1] - right_shoulder[1]]
+        #calculating angles
+        angll = calc_angle(vl1,vl2)
+        anglr = calc_angle(vr1,vr2)
+        angles_dic[f'{key}'] = [angll,anglr]
+    return angles_dic
+
+def calc_angles_lower_body(keypoints_dict,kp_conf):
     #angles dictionary to store angles between doby and legs of each object
     angles_dic = {}
     for key in keypoints_dict:
@@ -191,56 +206,33 @@ def annotate_object(box,box_color,text,font_scale,font_thickness,frame):
         lineType=cv2.LINE_AA
         )
 
-def calc_grad(dist_dict):
+#angle treshold for detecting whether hand is up or down, adjust it as you wish
+angle_tresh = 75
 
-    return
-
-text2 = "No sitting"
-text1 = "Sitting"
-text3 = "No people in sight"
-color2 = (100, 200, 0)
-color1 = (100, 0, 200)
-color3 = (100, 100, 100)
-font_scale = 1.6
-thickness = 2
-
-winsize = 60
-angles_dict = {}
-angle_tresh = 112
-all_keypoints = {}
-average_angles = {}
-grad_dict = {}
 while cap.isOpened():
 # Read a frame from the video
     success, frame = cap.read()
     if success:
-        frame = cv2.resize(frame,(1280,704))
-        results = model.predict(frame, persist=True, retina_masks=True, boxes=True, show_conf=False, line_width=1,  conf=0.3, iou=0.5,  classes=0, show_labels=False, device=device,verbose = True,tracker="bytetrack.yaml")
+        results = model.track(frame, persist=True, retina_masks=True, boxes=True, show_conf=False, line_width=1,  conf=0.3, iou=0.5,  classes=0, show_labels=False, device=device,verbose = False,tracker="bytetrack.yaml")
         boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
         if results[0].boxes.id is not None:
             ids = results[0].boxes.id.cpu().numpy().astype(int)
+
             #extracting keypoints
+            kp = extract_keypoints(results = results,threshold_class=0.4)
+            
+            # computing angles
+            angles = calc_angles_upper_body(kp,0.5)
 
-            kp = extract_keypoints(results = results,threshold_class=0.2)
-    
-            #calculating distances between keypoints
-
-            angles = calc_angles(kp,0.5)
-            #appending distances dictionary and evaluating average distance and classification based on it
             for key in angles.keys():
 
-                if key not in angles_dict.keys():
-                    angles_dict[key] = deque(maxlen=winsize)
-
-                angles_dict[key].append(angles[key])
-                average_angles[key] = np.mean(angles_dict[key])
                 for angle in angles[key]:
                     aydi = np.where(ids == int(key))[0]
-                    if 70<angle < angle_tresh:
-                        annotate_object(boxes[aydi][0],(255,0,0),"Person is sitting",1,1,frame)
+                    if 0 <angle < angle_tresh:
+                        annotate_object(boxes[aydi][0],(255,0,0),"Hands are up",1,1,frame)
                         break
                     else: 
-                        annotate_object(boxes[aydi][0],(0,255,0),"Person is not sitting",1,1,frame)
+                        annotate_object(boxes[aydi][0],(0,255,0),"Hands are down",1,1,frame)
 
 
         annotated_frame_show = cv2.resize(frame, (1080, 720))
