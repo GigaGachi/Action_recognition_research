@@ -99,7 +99,7 @@ def calc_angle(v1,v2):
         return None
 
 def calc_angles_upper_body(keypoints_dict,kp_conf):
-    #angles dictionary to store angles between doby and legs of each object
+    #angles dictionary to store angles between body and hands of each object
     angles_dic = {}
     for key in keypoints_dict:
         #extracting keypoints
@@ -220,20 +220,21 @@ while cap.isOpened():
 
             #extracting keypoints
             kp = extract_keypoints(results = results,threshold_class=0.4)
-            
+
             # computing angles
             angles = calc_angles_upper_body(kp,0.5)
 
             for key in angles.keys():
 
+                num_angles = 0
                 for angle in angles[key]:
                     aydi = np.where(ids == int(key))[0]
                     if 0 <angle < angle_tresh:
-                        annotate_object(boxes[aydi][0],(255,0,0),"Hands are up",1,1,frame)
-                        break
-                    else: 
-                        annotate_object(boxes[aydi][0],(0,255,0),"Hands are down",1,1,frame)
-
+                        num_angles = num_angles + 1
+                if num_angles ==0:
+                    annotate_object(boxes[aydi][0],(0,255,0),f"Hands are down",1,1,frame)
+                else:
+                    annotate_object(boxes[aydi][0],(255,0,0),f"{num_angles}Hands are up",1,1,frame)
 
         annotated_frame_show = cv2.resize(frame, (1080, 720))
         cv2.imshow("YOLOv8 Inference", annotated_frame_show)
