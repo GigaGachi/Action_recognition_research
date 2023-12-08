@@ -106,7 +106,6 @@ def calc_distances(hands_dict,body_kp,head_kp):
     
     return dist_dict
 
-
 def extract_hands_keypoints(results, threshold_class, threshold_keypoint):
     # creating a dictionary to collect keypoints to each object id as dictionary key
     existing_kp = {}
@@ -177,7 +176,6 @@ def extract_head_keypoints(results,threshold_class, threshold_keypoint):
         existing_kp[int(i_d)] = mid_point
     return existing_kp
 
-
 def extract_keypoints(results, threshold_class):
     existing_kp = {}
     for result,i_d in zip(results[0],results[0].boxes.id):
@@ -217,7 +215,6 @@ def calc_euclid_dist(p1,p2):
     else: 
         return np.nan
     
-
 def preprocess_keypoints(keypoints):
     kepoint = np.array(keypoints)
     for i,line in enumerate(kepoint):
@@ -251,12 +248,12 @@ def preprocess_keypoints(keypoints):
 #fight detection neural network loading
 fight_net= torch.jit.load('fight_detection.pt')
 fight_net.eval()
-
+fight_net.train(False)
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-modely = YOLO('yolov8l-pose.pt')  # load a pretrained YOLOv8n classification model
+modely = YOLO('yolov8n-pose.pt')  # load a pretrained YOLOv8n classification model
 modely.to(device)
 
 #Choose your video or stream there
