@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 from collections import deque
 from time import time
+
+import torch.utils
+import torch.utils.data
 import MCDWrapper
 import pybgs as bgs
 import torch
@@ -10,9 +13,14 @@ import torch.nn as nn
 import torch.optim as optim
 import os
 from tqdm import tqdm
+from ray import train, tune
+from ray.train import Checkpoint
+from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.optuna import OptunaSearch
+
 
 class kp_with_descr:
-    def __init__(self, kp = None, descr = None):
+    def __init__(self, kp = (None,None), descr = ()):
         self.kp = kp
         self.descr = descr
 
@@ -51,11 +59,16 @@ class trajectory:
             speed_y = p2[1] - p1[1]
             self.speed_list.append((speed_x,speed_y))
 
+    def remove_last_n_elements(self, arr,n):
+            return arr[:-n] if n <= len(arr) else np.array([])
+
     def get_point_array(self):
         return [x.kp for x in self.trajectory_]
+    
     def save_trajectory(self):
         print("trajectories/traj_" +f"{self.__hash__()}" +"_size_of_"+ f"{self.size}","trajectory surance:  ",self.real_size/self.size)
-        np.save("trajectories/traj_" +f"{self.__hash__()}" +"_size_of_"+ f"{self.size}_{self.real_size/self.size:.3f}",np.array(self.get_point_array))
+        # print(self.remove_last_n_elements(self.get_point_array(),10))
+        np.save("trajectories/traj_" +f"{self.__hash__()}" +"_size_of_"+ f"{self.size}_{self.real_size/self.size:.3f}",np.array(self.remove_last_n_elements(self.get_point_array(),10)),allow_pickle=True)
 
     def analyze(self):
         
@@ -63,7 +76,7 @@ class trajectory:
         # print(self.size,self.real_size/self.size,delta_r )
         if (self.size > 60) and ((self.real_size/self.size)>0.90) and ((delta_r)>40):
             
-            self.save_trajectory(self.last_kp)   
+            self.save_trajectory()   
     
     def euclidean_distance(self,p1, p2):
             return np.sqrt((p1.kp[0] - p2.kp[0])**2 + (p1.kp[1] - p2.kp[1])**2)
@@ -876,7 +889,7 @@ class npy_processor:
 
         for npy_file in npy_files:
             file_path = os.path.join(path, npy_file)
-            arrays.append(np.load(file_path))
+            arrays.append(np.load(file_path,allow_pickle=True))
         
         return arrays
     
@@ -886,10 +899,10 @@ class npy_processor:
     
     def process_data(self,list_of_sequence):
         for sequence in list_of_sequence:
-            sequence = self.remove_last_n_elements(sequence,10)
-            print(sequence)
+            # sequence = self.remove_last_n_elements(sequence,10)
+            # print(sequence)
             sequence = self.linear_interpolate(sequence)
-            print(sequence)
+            # print(sequence)
         return list_of_sequence
     
     def process_dataset(self,directory):
@@ -898,27 +911,27 @@ class npy_processor:
         
         return self.process_data(list_of_sequence)
         
-    def linear_interpolate(points):
+    def linear_interpolate(self, points):
         def interpolate(p1, p2, alpha):
-            return [p1[i] * (1 - alpha) + p2[i] * alpha for i in range(len(p1))]
+            return [int(round(p1[i] * (1 - alpha) + p2[i] * alpha)) for i in range(len(p1))]
         
         n = len(points)
         result = points[:]
         
         for i in range(n):
-            if points[i] == []:
+            if points[i][0] is None:
                 # Find previous and next valid points
                 prev_idx = next_idx = None
                 
                 # Find previous valid point
                 for j in range(i - 1, -1, -1):
-                    if points[j] != []:
+                    if points[j][0] is not None:
                         prev_idx = j
                         break
                 
                 # Find next valid point
                 for j in range(i + 1, n):
-                    if points[j] != []:
+                    if points[j][0] is not None:
                         next_idx = j
                         break
                 
@@ -928,33 +941,64 @@ class npy_processor:
                     result[i] = interpolate(points[prev_idx], points[next_idx], alpha)
                 elif prev_idx is not None and next_idx is None:
                     # Use two previous valid points to interpolate
-                    if prev_idx >= 1 and points[prev_idx - 1] != []:
+                    if prev_idx >= 1 and points[prev_idx - 1][0] is not None:
                         result[i] = interpolate(points[prev_idx - 1], points[prev_idx], 1)
                     else:
                         result[i] = points[prev_idx]
                 elif prev_idx is None and next_idx is not None:
                     # Use two next valid points to interpolate
-                    if next_idx + 1 < n and points[next_idx + 1] != []:
+                    if next_idx + 1 < n and points[next_idx + 1][0] is not None:
                         result[i] = interpolate(points[next_idx], points[next_idx + 1], 0)
                     else:
                         result[i] = points[next_idx]
         
         return result
 
+def normalize_2d_points(points,mean = None, std = None):
+        """
+        Normalize a sequence of 2D points.
+        
+        Parameters:
+        points (np.ndarray): An array of shape (n, 2) where n is the number of points.
+        
+        Returns:
+        normalized_points (np.ndarray): An array of normalized points of shape (n, 2).
+        mean (np.ndarray): The mean of the original points.
+        std (np.ndarray): The standard deviation of the original points.
+        """
+        points = np.array(points,dtype = np.float32)
+        if (std is None and mean is None):
+            mean = np.mean(points, axis=0)
+            std = np.std(points, axis=0)
+
+        for i,std_i in enumerate(std):
+            if std_i < 0.01:
+                std[i] = 0.00001
+
+        
+        normalized_points = (points - mean) / std
+        return normalized_points, mean, std
+
+
 class sequence_dataset(torch.utils.data.Dataset):
     
     def __init__(self, sequences, N, M):
         self.N = N
         self.M = M
-        self.pairs = []
+        self.pairs = list()
 
         for seq in sequences:
             seq_len = len(seq)
             # Create pairs of smaller sequences of lengths M and N
             for i in range(0, seq_len - M - N + 1, N):
                 sequence_M = seq[i:i + M]
+
+                sequence_M,mean,std = normalize_2d_points(sequence_M)
                 sequence_N = seq[i + M:i + M + N]
-                self.pairs.append((sequence_M, sequence_N))
+                
+                sequence_N, _, __ = normalize_2d_points(sequence_N,mean,std)
+                # print(mean,std)
+                self.pairs.append((sequence_M, sequence_N,mean,std))
 
     def __len__(self):
         return len(self.pairs)
@@ -963,24 +1007,237 @@ class sequence_dataset(torch.utils.data.Dataset):
         return self.pairs[idx]
 
 class trajectory_predictor(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size):
+    def __init__(self, hidden_size, num_layers,input_seq_len,output_seq_len,dropout):
         super(trajectory_predictor, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
-        self.normalize = nn.InstanceNorm1d(2)
-
+        self.output_size = 2
+        self.input_size = 2
+        self.input_seq_len = input_seq_len
+        self.output_seq_len = output_seq_len
+        self.lstm = nn.LSTM(2, hidden_size, num_layers, batch_first=True,dropout = dropout)
+        self.fc = nn.Linear(hidden_size*input_seq_len, output_seq_len*2 )
+        # self.normalize = nn.InstanceNorm1d(2)
+        
     def forward(self, x):
-        # Initialize hidden state with zeros
-        # h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        # c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        # print(x.shape)
+        # print("input",x[0])
+        # x = x.permute(0, 2, 1)
+        # x = self.normalize(x)
+        # x = x.permute(0, 2, 1)
+        # print("normalized",x[0])
+        # print(x.shape)
+        lstm_out, _ = self.lstm(x)
+        # print(lstm_out.shape)
+        lstm_out = lstm_out.contiguous().view(lstm_out.size(0), -1)
+        # print(lstm_out.shape)
+        x = self.fc(lstm_out)
+        # print(x.shape)
+        x = x.view(-1, self.output_seq_len , self.output_size)
+        # print(x.shape)
+        return x
 
-        x = self.normalize(x) 
+def train_best_model(config:dict):
+    
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    # print(device)
+    batch_size = config['batch_size']
+    learning_rate = config['learning_rate']
+    input_seq_len= config['input_seq_len']
+    output_seq_len = config['output_seq_len']
+    hidden_size = config['hidden_size']
+    num_layers = config['num_layers']
+    dropout = config["dropout"]
+    
+    traj_path = "/home/iustimov/tasks/traj_pred/trajectories"
 
-        # Forward propagate LSTM
-        out, _ = self.lstm(x)
+    npy_loader = npy_processor(traj_path)
 
-        # Decode the hidden state of the last time step
-        out = self.fc(out[:, -1, :])
-        return out
+    list_of_sequences = npy_loader.process_dataset(traj_path)
+
+    train_data= sequence_dataset(list_of_sequences,output_seq_len,input_seq_len)
+    
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
+
+    model = trajectory_predictor(input_seq_len=input_seq_len,hidden_size=hidden_size,num_layers=num_layers,output_seq_len=output_seq_len,dropout=dropout)
+
+    model.to(device)
+
+    loss_fn = torch.nn.MSELoss()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,amsgrad=False)
+
+    trained_model = train_model(model=model,loss_fn=loss_fn,optimizer=optimizer,train_loader=train_loader,val_loader=train_loader,n_epoch=50,device=device)
+
+    # loss_val = evaluate_model(trained_model,test_loader,loss_fn=loss_fn,device=device)
+
+    return trained_model
+
+def training_sequence(config: dict):
+    
+    split_percent = 0.75
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    # print(device)
+    batch_size = config['batch_size']
+    learning_rate = config['learning_rate']
+    input_seq_len= config['input_seq_len']
+    output_seq_len = config['output_seq_len']
+    hidden_size = config['hidden_size']
+    num_layers = config['num_layers']
+    dropout = config["dropout"]
+    
+    traj_path = "/home/iustimov/tasks/traj_pred/trajectories"
+
+    npy_loader = npy_processor(traj_path)
+
+    list_of_sequences = npy_loader.process_dataset(traj_path)
+
+    train_data= sequence_dataset(list_of_sequences,output_seq_len,input_seq_len)
+    
+    train_size = int(len(train_data) * split_percent)
+
+    test_size = len(train_data) - train_size
+
+    train_data, test_data= torch.utils.data.random_split(train_data, [train_size, test_size])
+    
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
+    #val_loader = torch.utils.data.DataLoader(val_data, batch_size=16, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=True)
+
+    model = trajectory_predictor(input_seq_len=input_seq_len,hidden_size=hidden_size,num_layers=num_layers,output_seq_len=output_seq_len,dropout=dropout)
+
+    model.to(device)
+
+    loss_fn = torch.nn.MSELoss()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,amsgrad=False)
+
+    trained_model = train_model(model=model,loss_fn=loss_fn,optimizer=optimizer,train_loader=train_loader,val_loader=test_loader,n_epoch=50,device=device,raytune_mode=True)
+
+    # loss_val = evaluate_model(trained_model,test_loader,loss_fn=loss_fn,device=device)
+
+def evaluate_model(model, dataloader, loss_fn):
+    
+    losses = 0
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    
+    model.train(False)
+    for i, batch in enumerate(dataloader):
+
+        with torch.no_grad():
+            X_batch, y_batch, mean, std = batch 
+                
+            predicted = model(X_batch.to(device,dtype = torch.float)) 
+
+            loss = loss_fn(predicted, y_batch.to(device,dtype = torch.float)) 
+            
+            losses+=loss
+    
+    
+    return losses/len(dataloader.dataset)
+
+def train_model(model,loss_fn, optimizer, train_loader: torch.utils.data.DataLoader,val_loader, device, n_epoch=3,raytune_mode = False):
+    
+        num_iter = 0
+        # цикл обучения сети
+        
+        for epoch in range(n_epoch):
+            
+            model.train(True)
+            for i, batch in enumerate(train_loader):
+                # так получаем текущий батч
+                
+                X_batch, y_batch,mean,std = batch 
+                # print("input",X_batch)
+                # print("stats", mean, std)
+                # print(y_batch.shape)
+                # forward pass (получение ответов на батч картинок)
+                predicted = model(X_batch.to(device,dtype = torch.float)) 
+                # print("pred",predicted)
+                # print("true",y_batch)
+                # print(predicted.shape)
+                # вычисление лосса от выданных сетью ответов и правильных ответов на батч
+                loss = loss_fn(predicted, y_batch.to(device,dtype = torch.float)) 
+                # print(loss)
+                
+                loss.backward() # backpropagation (вычисление градиентов)
+                optimizer.step() # обновление весов сети
+                optimizer.zero_grad() # обнуляем веса
+
+                num_iter += 1
+
+
+            # после каждой эпохи получаем метрику качества на валидационной выборке
+            if ((epoch+1)%10 ==0) and (raytune_mode == True):
+                model.train(False)
+                val_loss = evaluate_model(model, val_loader, loss_fn=loss_fn)
+                # train_loss = evaluate_model(model, train_loader, loss_fn=loss_fn)
+                torch.save((model.state_dict(), optimizer.state_dict()), "/home/iustimov/tasks/traj_pred/checkpoint_models/checkpoint.pt")
+                checkpoint = Checkpoint.from_directory("/home/iustimov/tasks/traj_pred/checkpoint_models")
+                train.report({"loss": val_loss.cpu().numpy()}, checkpoint=checkpoint)
+       
+            # if ((epoch+1)%25 ==0) and (raytune_mode == True):
+            #     os.makedirs("checkpoint_models", exist_ok=True)
+            #     torch.save(
+            #                 (model.state_dict(), optimizer.state_dict()), "checkpoint_models/checkpoint.pt")
+            #     checkpoint = Checkpoint.from_directory("checkpoint_models")
+            #     train.report({"loss": val_loss}, checkpoint=checkpoint)
+
+        return model
+
+def ray_tune(config_hp,num_samples=1, max_num_epochs=100, gpus_per_trial=1):
+    
+    scheduler = ASHAScheduler(
+        max_t=max_num_epochs,
+        grace_period=1,
+        reduction_factor=2)
+    
+    tuner = tune.Tuner(
+        tune.with_resources(
+            tune.with_parameters(training_sequence),
+            resources={"cpu": 10, "gpu": gpus_per_trial}
+        ),
+        param_space=config_hp,
+        run_config=train.RunConfig(
+        name="traj-exp",
+        storage_path="/home/iustimov/tasks/traj_pred/ray/",
+        checkpoint_config=train.CheckpointConfig(
+            checkpoint_score_attribute="loss",
+            checkpoint_score_order="min",
+            num_to_keep=5,
+        ),
+        ),
+        tune_config=tune.TuneConfig(
+            search_alg=OptunaSearch(),
+            metric="loss",
+            mode="min",
+            scheduler=scheduler,
+            num_samples=num_samples,
+        ),
+        
+    )
+
+    results = tuner.fit()
+        
+    best_result = results.get_best_result("loss", "min")
+    
+    print("Best trial config: {}".format(best_result.config))
+        
+    best_model = train_best_model(best_result.config)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    example_input = torch.randn((1, best_result.config["input_seq_len"], 2)).to(device=device)
+    onnx_file_path = "trajectory_predictor.onnx"
+    torch.onnx.export(best_model, 
+                  example_input, 
+                  onnx_file_path, 
+                  export_params=True, 
+                  opset_version=10, 
+                  do_constant_folding=True, 
+                  input_names=['input'], 
+                  output_names=['output'], 
+                  )
+
+    print(f"Model has been exported to {onnx_file_path}")
+        
+    return results
