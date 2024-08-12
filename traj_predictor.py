@@ -68,18 +68,18 @@ class trajectory:
     def get_point_array(self):
         return [x.kp for x in self.trajectory_]
     
-    def save_trajectory(self):
-        print("_size_of_"+ "trajectories_onlydrone/traj_" +f"{self.__hash__()}" +f"{self.size}","trajectory surance:  ",self.real_size/self.size)
+    def save_trajectory(self,traj_path):
+        print("_size_of_"+ traj_path + "/traj_" +f"{self.__hash__()}" +f"{self.size}","trajectory surance:  ",self.real_size/self.size)
         # print(self.remove_last_n_elements(self.get_point_array(),10))
-        np.save("trajectories_onlydrone/traj"+"_size_of_"+f"{self.size}_{self.real_size/self.size:.3f}" +f"_{self.__hash__()}" ,np.array(self.remove_last_n_elements(self.get_point_array(),10)),allow_pickle=True)
+        np.save(traj_path+"/traj"+"_size_of_"+f"{self.size}_{self.real_size/self.size:.3f}" +f"_{self.__hash__()}" ,np.array(self.remove_last_n_elements(self.get_point_array(),10)),allow_pickle=True)
 
     def analyze(self):
-        
+        traj_path = "trajectories_onlydrone"
         delta_r = self.euclidean_distance(self.last_kp, self.trajectory_[0])
         # print(self.size,self.real_size/self.size,delta_r )
-        if (self.size > 60) and ((self.real_size/self.size)>0.85) and ((delta_r)>15):
+        if (self.size > 30) and ((self.real_size/self.size)>0.85) and ((delta_r)>15):
             
-            self.save_trajectory()   
+            self.save_trajectory(traj_path=traj_path)   
     
     def euclidean_distance(self,p1, p2):
             return np.sqrt((p1.kp[0] - p2.kp[0])**2 + (p1.kp[1] - p2.kp[1])**2)
@@ -1016,8 +1016,6 @@ class trajectory_predictor(nn.Module):
         return x
 
 
-
-
 def initialize_model_from_pt(Best_config,model_path):
     
     best_model = torch.jit.load(model_path)
@@ -1046,13 +1044,15 @@ def train_best_model(config:dict,debug):
     num_layers = config['num_layers']
     dropout = config["dropout"]
     
-    traj_path = "/home/iustimov/tasks/traj_pred/trajectories"
+    traj_path = config["traj_path"]
 
     npy_loader = npy_processor(traj_path)
 
     list_of_sequences = npy_loader.process_dataset(traj_path)
 
     train_data= sequence_dataset(list_of_sequences,output_seq_len,input_seq_len)
+    
+    print("NUMBER OF TRAJECTORIES:   ", train_data.__len__)
     
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
 
@@ -1074,7 +1074,7 @@ def train_best_model(config:dict,debug):
 
 def training_sequence(config: dict):
     
-    split_percent = 0.85
+    split_percent = 0.75
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     # print(device)
     batch_size = config['batch_size']
@@ -1085,7 +1085,7 @@ def training_sequence(config: dict):
     num_layers = config['num_layers']
     dropout = config["dropout"]
     
-    traj_path = "/home/iustimov/tasks/traj_pred/trajectories"
+    traj_path = config["traj_path"]
 
     npy_loader = npy_processor(traj_path)
 
@@ -1178,7 +1178,7 @@ def train_model(model,loss_fn, optimizer, train_loader: torch.utils.data.DataLoa
 
 
             # после каждой эпохи получаем метрику качества на валидационной выборке
-            if ((epoch+1)%10 ==0) and (raytune_mode == True):
+            if ((epoch+1)%2 ==0) and (raytune_mode == True):
                 model.train(False)
                 val_loss = evaluate_model(model, val_loader, loss_fn=loss_fn)
                 # train_loss = evaluate_model(model, train_loader, loss_fn=loss_fn)
@@ -1196,7 +1196,7 @@ def train_model(model,loss_fn, optimizer, train_loader: torch.utils.data.DataLoa
 
         return model
 
-def ray_tune(config_hp,num_samples=1, max_num_epochs=100, gpus_per_trial=1):
+def ray_tune(config_hp,num_samples=1, max_num_epochs=50, gpus_per_trial=1):
     
     scheduler = ASHAScheduler(
         max_t=max_num_epochs,
@@ -1236,19 +1236,16 @@ def ray_tune(config_hp,num_samples=1, max_num_epochs=100, gpus_per_trial=1):
     print("Best trial config: {}".format(best_result.config))
         
     best_model = train_best_model(best_result.config,True)
-    # torch.jit.trace(best_model)
+
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    # example_input = torch.randn((1, best_result.config["input_seq_len"], 2)).to(device=device)
-    # traced_model = torch.jit.trace(best_model,example_input)
-    # traced_model_path = "traced_trajectory_predictor.pt"
-    # traced_model.save(traced_model_path)
+
     example_input = torch.randn((1, best_result.config["input_seq_len"], 2)).to(device=device)
-    onnx_file_path = "trajectory_predictor2.onnx"
+    onnx_file_path = "trajectory_predictor_only_synthetic.onnx"
     torch.onnx.export(best_model, 
                   example_input, 
                   onnx_file_path, 
                   export_params=True, 
-                  opset_version=10, 
+                  opset_version=14, 
                   do_constant_folding=True, 
                   input_names=['input'], 
                   output_names=['output']
@@ -1256,6 +1253,6 @@ def ray_tune(config_hp,num_samples=1, max_num_epochs=100, gpus_per_trial=1):
 
     print(f"Model has been exported to {onnx_file_path}")
         
-    return results
+    return best_result.config
 
 
