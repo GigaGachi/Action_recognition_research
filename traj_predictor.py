@@ -12,22 +12,58 @@ from torch import nn
 import torch.nn as nn
 import torch.optim as optim
 import os
+import onnx
+import onnxruntime as ort
 from tqdm import tqdm
 from ray import train, tune
 from ray.train import Checkpoint
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.search.optuna import OptunaSearch
+from torch.fx import symbolic_trace
 from utils import normalize_2d_points, denormalize, linear_interpolate
-
-
+from torch.quantization import quantize_fx, QConfig, FakeQuantize, MovingAverageMinMaxObserver,MovingAveragePerChannelMinMaxObserver
+# from torch.ao.quantization import (
+#   get_default_qconfig_mapping,
+#   get_default_qat_qconfig_mapping,
+#   QConfigMapping,
+# )
 
 class kp_with_descr:
+    """
+    Helper class to store keypoint in pair with its descriptor
+
+    ...
+
+    Attributes
+    ----------
+    kp : list(int,int)
+        (x,y) coordinate of keypoint
+    descriptor : list(int,...)
+        descriptor in some hamming form
+    """
+
+    
+    
     def __init__(self, kp = (None,None), descr = ()):
         self.kp = kp
         self.descr = descr
 
 class trajectory:
-    
+    """
+    Trajectory class used to store sequence of keypoints with descriptor, update, analyze them, and store
+
+    ...
+
+    Attributes
+    ----------
+    trajectory_ : list()
+        list of kp_with_descr   
+
+    Methods
+    -------
+    update(kp)
+        Appends trajectory with given keypoint
+    """
     def __init__(self,kp1 = None ,kp2 = None):
         self.trajectory_ = list()
         self.trajectory_.append(kp1)
@@ -103,6 +139,23 @@ class match:
         self.second_point = kp2_with_descr
 
 class trajectory_list:
+    """
+    Trajectory list class used to store current trajectories and processs them
+
+    ...
+
+    Attributes
+    ----------
+    trajectory_list_ : list()
+        list of trajectory
+    overtime : int
+        maximum update ticks that trajectory could not be appended (if not appended for more then overtime remove it)   
+
+    Methods
+    -------
+    update_trajectories(list_of_matches)
+        updates trajectories with list of matches, containing current detected keypoint and matched keypoint from previous frame
+    """
     def __init__(self,overtime = 5):
         self.trajectory_list_ = list()
         self.size = 0
@@ -153,6 +206,15 @@ class trajectory_list:
             # trajectory.dump_trajectory()
         
 class traj_extractor:
+    
+    """
+    Trajectory extractor class used process video and extract trajectories in .npy format
+
+    ...
+    Methods
+    -------
+    """
+    
     
     
     def __init__(self):
@@ -780,25 +842,62 @@ class FlowEstimator:
         cv2.destroyAllWindows()
 
 class extractor_and_predictor:
-    
-    def __init__(self,model,traj_extractor:traj_extractor,debug, device):
+    """
+    Class used to inference on video. Contains extractor and predictor network
+
+    ...
+
+    Attributes
+    ----------
+    model : nn.Module
+        initialized and trained model 
+    traj_extractor : traj_extractor
+        initialized trajectory extractor
+        
+    Methods
+    -------
+    update_trajectories(list_of_matches)
+        updates trajectories with list of matches, containing current detected keypoint and matched keypoint from previous frame
+    """
+    def __init__(self,model,traj_extractor:traj_extractor,is_onnx,debug, device):
         self.traj_extractor = traj_extractor
         self.model = model
         self.debug = debug
         self.device = device
         self.min_traj_len_to_predict = 50
-        self.min_traj_surance_to_predict = 0.8
+        self.min_traj_surance_to_predict = 0.1
+        self.is_onnx = is_onnx
         
-        model.to(self.device)
+        if (self.is_onnx == False):
+            model.to(self.device)
     
     def predict_trajectory(self,interpolated_traj):
         
                 
         normalized_traj,mean,std = normalize_2d_points(interpolated_traj)
-                
+        
+        self.model.eval()
+        
         predicted = self.model(torch.from_numpy(np.array([normalized_traj])).to(self.device))
               
         denormalized_pred = denormalize(predicted.detach().cpu().numpy(),mean,std)
+
+        return denormalized_pred
+    
+    def predict_trajectory_onnx(self,interpolated_traj):
+        
+        
+        input_name = self.model.session.get_inputs()[0].name
+        output_name = self.model.session.get_outputs()[0].name
+        
+        normalized_traj,mean,std = normalize_2d_points(interpolated_traj)
+        
+        
+        predicted = self.model.session.run([output_name], {input_name: np.array([normalized_traj])})
+              
+        print(predicted)
+              
+        denormalized_pred = denormalize(predicted[0],mean,std)
 
         return denormalized_pred
             
@@ -811,7 +910,10 @@ class extractor_and_predictor:
                 
                 interpolated_traj = linear_interpolate(trajectory.get_point_array()[-self.model.input_seq_len:])
                 
-                denormalized_pred = self.predict_trajectory(interpolated_traj=interpolated_traj)
+                if (self.is_onnx):
+                    denormalized_pred = self.predict_trajectory_onnx(interpolated_traj=interpolated_traj)
+                else:
+                    denormalized_pred = self.predict_trajectory(interpolated_traj=interpolated_traj)
                 
                 denormalized_pred_int = denormalized_pred.astype(int)
                 
@@ -903,8 +1005,7 @@ class extractor_and_predictor:
                       
         cap.release()
         cv2.destroyAllWindows()
-    
-    
+        
     def draw_trajectory(self,frame,trajectory,color):
         for point in trajectory:
             # print(point)
@@ -980,6 +1081,16 @@ class sequence_dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.pairs[idx]
 
+class onnx_trajectory_predictor:
+    def __init__(self, hidden_size, num_layers,input_seq_len,output_seq_len,dropout,session):
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.output_size = 2
+        self.input_size = 2
+        self.input_seq_len = input_seq_len
+        self.output_seq_len = output_seq_len
+        self.session = session
+
 class trajectory_predictor(nn.Module):
     def __init__(self, hidden_size, num_layers,input_seq_len,output_seq_len,dropout):
         super(trajectory_predictor, self).__init__()
@@ -994,7 +1105,12 @@ class trajectory_predictor(nn.Module):
         self.flatten = nn.Flatten()
         # self.normalize = nn.InstanceNorm1d(2)
         
-    def forward(self, x):
+        
+    #INPUT [BATCH_SIZE,INPUT_SEQ_LEN,2], OUTPUT [BATCH_SIZE,OUTPUT_SEQ_LEN,2]    
+    def forward(self, input_sequence):
+
+        
+        
         # print(x.shape)
         # print("input",x[0])
         # x = x.permute(0, 2, 1)
@@ -1003,18 +1119,53 @@ class trajectory_predictor(nn.Module):
         # print("normalized",x[0])
         # print("1",x.shape)
         # print("2",x)
-        lstm_out, _ = self.lstm(x)
+        lstm_out, _ = self.lstm(input_sequence)
         # print(lstm_out.shape)
         lstm_out = self.flatten(lstm_out)
         # print(lstm_out.shape)
         x = self.fc(lstm_out)
         # print("3",x)
         # print("4",x.shape)
-        x = x.view(-1, self.output_seq_len , self.output_size)
+        output_sequence = x.view(-1, self.output_seq_len , self.output_size)
         # print("5",x)
         # print("6",x.shape)
-        return x
+        return output_sequence
 
+class graph_trajectory_predictor(nn.Module):
+    def __init__(self, hidden_size, num_layers,input_seq_len,output_seq_len,dropout,graph_module):
+        super(graph_trajectory_predictor, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.output_size = 2
+        self.input_size = 2
+        self.input_seq_len = input_seq_len
+        self.output_seq_len = output_seq_len
+        self.graph_module = graph_module
+        
+        
+    #INPUT [BATCH_SIZE,INPUT_SEQ_LEN,2], OUTPUT [BATCH_SIZE,OUTPUT_SEQ_LEN,2]    
+    def forward(self, input_sequence):
+        return self.graph_module(input_sequence)
+        
+def initialize_session_from_onnx_quant(Best_config,model_path):
+    
+
+    best_model = onnx.load(model_path)
+    onnx.checker.check_model(best_model)
+    
+    input_seq_len= Best_config['input_seq_len']
+    output_seq_len = Best_config['output_seq_len']
+    hidden_size = Best_config['hidden_size']
+    num_layers = Best_config['num_layers']
+    dropout = Best_config["dropout"]
+        
+    ort_session = ort.InferenceSession(model_path)
+    
+    model = onnx_trajectory_predictor(input_seq_len=input_seq_len,hidden_size=hidden_size,num_layers=num_layers,
+                                      output_seq_len=output_seq_len,dropout=dropout,session=ort_session)
+
+    
+    return model
 
 def initialize_model_from_pt(Best_config,model_path):
     
@@ -1032,10 +1183,61 @@ def initialize_model_from_pt(Best_config,model_path):
     
     return model
 
+def initialize_quantized_from_pth(Best_config,model_path):
+    
+    input_seq_len= Best_config['input_seq_len']
+    output_seq_len = Best_config['output_seq_len']
+    hidden_size = Best_config['hidden_size']
+    num_layers = Best_config['num_layers']
+    dropout = Best_config["dropout"]
+        
+    model = trajectory_predictor(input_seq_len=input_seq_len,hidden_size=hidden_size,num_layers=num_layers,output_seq_len=output_seq_len,dropout=dropout)
+
+    # Trace the model with FX symbolic tracing
+    # traced_model = symbolic_trace(model)
+    
+    # Prepare the model for quantization (setup qconfig)
+    qconfig = QConfig(activation=FakeQuantize.with_args(observer=
+        MovingAverageMinMaxObserver,
+        quant_min=0,
+        quant_max=255,
+        reduce_range=False), # reudece_range -> the default is True
+        weight=FakeQuantize.with_args(observer=
+        MovingAveragePerChannelMinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_channel_affine,
+        #qscheme->the default is torch.per_channel_symmetric
+
+    reduce_range=False))
+    
+    example_input = torch.randn((1, Best_config["input_seq_len"], 2))
+    
+    prepared_model = quantize_fx.prepare_fx(model, {"": qconfig},example_input)
+    
+    # Convert the prepared model to a quantized model
+    quantized_model = quantize_fx.convert_fx(prepared_model)
+    
+    # Load the state dictionary from the saved file
+    quantized_model.load_state_dict(torch.load(model_path))
+    
+    graph_model = graph_trajectory_predictor(input_seq_len=input_seq_len,
+                                             hidden_size=hidden_size,
+                                             num_layers=num_layers,
+                                             output_seq_len=output_seq_len,
+                                             dropout=dropout,
+                                             graph_module=quantized_model)
+
+    
+    # print(quantized_model.print_readable())
+    # Return the loaded quantized model
+    return graph_model
+
 def train_best_model(config:dict,debug):
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    # print(device)
+    print(device)
     batch_size = config['batch_size']
     learning_rate = config['learning_rate']
     input_seq_len= config['input_seq_len']
@@ -1043,7 +1245,8 @@ def train_best_model(config:dict,debug):
     hidden_size = config['hidden_size']
     num_layers = config['num_layers']
     dropout = config["dropout"]
-    
+    ams_grad = config["ams_grad"]
+    weight_decay = config["weight_decay"]
     traj_path = config["traj_path"]
 
     npy_loader = npy_processor(traj_path)
@@ -1052,7 +1255,7 @@ def train_best_model(config:dict,debug):
 
     train_data= sequence_dataset(list_of_sequences,output_seq_len,input_seq_len)
     
-    print("NUMBER OF TRAJECTORIES:   ", train_data.__len__)
+    print("NUMBER OF TRAJECTORIES:   ", train_data.__len__())
     
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
 
@@ -1062,11 +1265,11 @@ def train_best_model(config:dict,debug):
 
     loss_fn = torch.nn.MSELoss()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,amsgrad=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,amsgrad=ams_grad,weight_decay=weight_decay)
 
-    trained_model = train_model(debug=debug,model=model,loss_fn=loss_fn,optimizer=optimizer,train_loader=train_loader,val_loader=train_loader,n_epoch=100,device=device,raytune_mode=False)
+    trained_model = train_model(debug=debug,model=model,loss_fn=loss_fn,optimizer=optimizer,train_loader=train_loader,val_loader=train_loader,n_epoch=10,device=device,raytune_mode=False)
 
-    loss_val = evaluate_model(trained_model,train_loader,loss_fn=loss_fn)
+    loss_val = evaluate_model(trained_model,train_loader,device,loss_fn=loss_fn)
     
     print(loss_val)
     
@@ -1084,6 +1287,8 @@ def training_sequence(config: dict):
     hidden_size = config['hidden_size']
     num_layers = config['num_layers']
     dropout = config["dropout"]
+    ams_grad = config["ams_grad"]
+    weight_decay = config["weight_decay"]
     
     traj_path = config["traj_path"]
 
@@ -1093,6 +1298,8 @@ def training_sequence(config: dict):
 
     train_data= sequence_dataset(list_of_sequences,output_seq_len,input_seq_len)
     
+    print("NUMBER OF TRAJECTORIES:   ", train_data.__len__())
+
     train_size = int(len(train_data) * split_percent)
 
     test_size = len(train_data) - train_size
@@ -1109,17 +1316,16 @@ def training_sequence(config: dict):
 
     loss_fn = torch.nn.MSELoss()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,amsgrad=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,amsgrad=ams_grad,weight_decay=weight_decay)
 
-    trained_model = train_model(debug=False,model=model,loss_fn=loss_fn,optimizer=optimizer,train_loader=train_loader,val_loader=test_loader,n_epoch=50,device=device,raytune_mode=True)
+    trained_model = train_model(debug=False,model=model,loss_fn=loss_fn,optimizer=optimizer,train_loader=train_loader,val_loader=test_loader,n_epoch=20,device=device,raytune_mode=True)
 
     # loss_val = evaluate_model(trained_model,test_loader,loss_fn=loss_fn,device=device)
 
-def evaluate_model(model, dataloader, loss_fn):
+def evaluate_model(model, dataloader,device, loss_fn):
     
     losses = 0
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     
     model.train(False)
     for i, batch in enumerate(dataloader):
@@ -1136,8 +1342,7 @@ def evaluate_model(model, dataloader, loss_fn):
     # print("true",y_batch[0])
     # print("pred",predicted[2])
     # print("true",y_batch[2])
-    
-    return 100*losses/len(dataloader.dataset)
+    return 100*losses/(len(dataloader.dataset)*y_batch.shape[1])
 
 def train_model(model,loss_fn, optimizer, train_loader: torch.utils.data.DataLoader,val_loader, device, n_epoch=3,raytune_mode = False,debug = False):
     
@@ -1176,11 +1381,15 @@ def train_model(model,loss_fn, optimizer, train_loader: torch.utils.data.DataLoa
 
                 num_iter += 1
 
-
+            if (debug == True):
+                print("EPOCH: ", epoch)
+                model.train(False)
+                val_loss = evaluate_model(model, val_loader,device, loss_fn=loss_fn)
+                print("LOSS: ", val_loss)
             # после каждой эпохи получаем метрику качества на валидационной выборке
             if ((epoch+1)%2 ==0) and (raytune_mode == True):
                 model.train(False)
-                val_loss = evaluate_model(model, val_loader, loss_fn=loss_fn)
+                val_loss = evaluate_model(model, val_loader,device, loss_fn=loss_fn)
                 # train_loss = evaluate_model(model, train_loader, loss_fn=loss_fn)
                 with tempfile.TemporaryDirectory() as temp_checkpoint_dir:
                     path = os.path.join(temp_checkpoint_dir, "checkpoint.pt")
@@ -1196,7 +1405,7 @@ def train_model(model,loss_fn, optimizer, train_loader: torch.utils.data.DataLoa
 
         return model
 
-def ray_tune(config_hp,num_samples=1, max_num_epochs=50, gpus_per_trial=1):
+def ray_tune(config_hp,num_samples=1, max_num_epochs=20, gpus_per_trial=1):
     
     scheduler = ASHAScheduler(
         max_t=max_num_epochs,
@@ -1206,7 +1415,7 @@ def ray_tune(config_hp,num_samples=1, max_num_epochs=50, gpus_per_trial=1):
     tuner = tune.Tuner(
         tune.with_resources(
             tune.with_parameters(training_sequence),
-            resources={"cpu": 10, "gpu": gpus_per_trial}
+            resources={"cpu": 1, "gpu": gpus_per_trial}
         ),
         param_space=config_hp,
         run_config=train.RunConfig(
@@ -1255,4 +1464,191 @@ def ray_tune(config_hp,num_samples=1, max_num_epochs=50, gpus_per_trial=1):
         
     return best_result.config
 
+def ray_tune_qat(config_hp,num_samples=1, max_num_epochs=20, gpus_per_trial=1):
+    
+    scheduler = ASHAScheduler(
+        max_t=max_num_epochs,
+        grace_period=1,
+        reduction_factor=2)
+    
+    tuner = tune.Tuner(
+        tune.with_resources(
+            tune.with_parameters(quantized_training_sequence),
+            resources={"cpu": 1, "gpu": gpus_per_trial}
+        ),
+        param_space=config_hp,
+        run_config=train.RunConfig(
+        name="traj-exp",
+        storage_path="/home/iustimov/tasks/traj_pred/ray/",
+        checkpoint_config=train.CheckpointConfig(
+            checkpoint_score_attribute="loss",
+            checkpoint_score_order="min",
+            num_to_keep=5,
+        ),
+        ),
+        tune_config=tune.TuneConfig(
+            search_alg=OptunaSearch(),
+            metric="loss",
+            mode="min",
+            scheduler=scheduler,
+            num_samples=num_samples,
+        ),
+    )
 
+    results = tuner.fit()
+    
+    # print(results)
+        
+    best_result = results.get_best_result(metric="loss",mode = "min")
+    
+    print("Best trial config: {}".format(best_result.config))
+        
+    # best_model = train_best_model(best_result.config,True)
+
+    # device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # example_input = torch.randn((1, best_result.config["input_seq_len"], 2)).to(device=device)
+    # onnx_file_path = "trajectory_predictor_only_synthetic.onnx"
+    # torch.onnx.export(best_model, 
+    #               example_input, 
+    #               onnx_file_path, 
+    #               export_params=True, 
+    #               opset_version=14, 
+    #               do_constant_folding=True, 
+    #               input_names=['input'], 
+    #               output_names=['output']
+    #               )
+
+    # print(f"Model has been exported to {onnx_file_path}")
+        
+    return best_result.config
+
+def quantized_training_sequence(config: dict):
+    split_percent = 0.75
+    device = torch.device('cpu')
+    print(device)
+    batch_size = config['batch_size']
+    learning_rate = config['learning_rate']
+    input_seq_len= config['input_seq_len']
+    output_seq_len = config['output_seq_len']
+    hidden_size = config['hidden_size']
+    num_layers = config['num_layers']
+    dropout = config["dropout"]
+    traj_path = config["traj_path"]
+    ams_grad = config["ams_grad"]
+    weight_decay = config["weight_decay"]
+    
+    qconfig = QConfig(activation=FakeQuantize.with_args(observer=
+    MovingAverageMinMaxObserver,
+    quant_min=0,
+    quant_max=255,
+    reduce_range=False), # reudece_range -> the default is True
+    weight=FakeQuantize.with_args(observer=
+    MovingAveragePerChannelMinMaxObserver,
+    quant_min=-128,
+    quant_max=127,
+    dtype=torch.qint8,
+    qscheme=torch.per_channel_affine,
+    #qscheme->the default is torch.per_channel_symmetric
+    reduce_range=False))
+    
+    qconfig_dict = {"": qconfig}
+            
+    npy_loader = npy_processor(traj_path)
+
+    list_of_sequences = npy_loader.process_dataset(traj_path)
+
+    train_data= sequence_dataset(list_of_sequences,output_seq_len,input_seq_len)
+    
+    print("NUMBER OF TRAJECTORIES:   ", train_data.__len__())
+    
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
+
+    model = trajectory_predictor(input_seq_len=input_seq_len,hidden_size=hidden_size,num_layers=num_layers,output_seq_len=output_seq_len,dropout=dropout)
+
+    example_input = torch.randn((1, config["input_seq_len"], 2)).to(device=device)
+    model_qat = quantize_fx.prepare_qat_fx(model, qconfig_dict,example_input)
+    
+    model_qat.to(device)
+    
+    loss_fn = torch.nn.MSELoss()
+
+    optimizer = torch.optim.AdamW(model_qat.parameters(), lr=learning_rate,amsgrad=ams_grad,weight_decay=weight_decay)
+
+    trained_model = train_model(debug=False,model=model_qat,loss_fn=loss_fn,optimizer=optimizer,train_loader=train_loader,val_loader=train_loader,n_epoch=10,device=device,raytune_mode=True)
+
+    loss_val = evaluate_model(trained_model,train_loader,device,loss_fn=loss_fn)
+    
+    print(loss_val)
+    
+    # print(trained_model.state_dict)
+    trained_qat_model= quantize_fx.convert_fx(trained_model)
+    
+def train_quantized_model(config:dict,debug):
+    
+    device = torch.device('cpu')
+    print(device)
+    batch_size = config['batch_size']
+    learning_rate = config['learning_rate']
+    input_seq_len= config['input_seq_len']
+    output_seq_len = config['output_seq_len']
+    hidden_size = config['hidden_size']
+    num_layers = config['num_layers']
+    dropout = config["dropout"]
+    traj_path = config["traj_path"]
+    ams_grad = config["ams_grad"]
+    weight_decay = config["weight_decay"]
+    
+    qconfig = QConfig(activation=FakeQuantize.with_args(observer=
+    MovingAverageMinMaxObserver,
+    quant_min=0,
+    quant_max=255,
+    reduce_range=False), # reudece_range -> the default is True
+    weight=FakeQuantize.with_args(observer=
+    MovingAveragePerChannelMinMaxObserver,
+    quant_min=-128,
+    quant_max=127,
+    dtype=torch.qint8,
+    qscheme=torch.per_channel_affine,
+    #qscheme->the default is torch.per_channel_symmetric
+
+    reduce_range=False))
+    
+    qconfig_dict = {"": qconfig}
+            
+    npy_loader = npy_processor(traj_path)
+
+    list_of_sequences = npy_loader.process_dataset(traj_path)
+
+    train_data= sequence_dataset(list_of_sequences,output_seq_len,input_seq_len)
+    
+    print("NUMBER OF TRAJECTORIES:   ", train_data.__len__())
+    
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
+
+    model = trajectory_predictor(input_seq_len=input_seq_len,hidden_size=hidden_size,num_layers=num_layers,output_seq_len=output_seq_len,dropout=dropout)
+
+    example_input = torch.randn((1, config["input_seq_len"], 2)).to(device=device)
+    
+    model_qat = quantize_fx.prepare_qat_fx(model, qconfig_dict,example_input)
+    
+    model_qat.to(device)
+    
+    loss_fn = torch.nn.MSELoss()
+
+    optimizer = torch.optim.AdamW(model_qat.parameters(), lr=learning_rate,amsgrad=ams_grad,weight_decay=weight_decay)
+
+    trained_model = train_model(debug=debug,model=model_qat,loss_fn=loss_fn,optimizer=optimizer,train_loader=train_loader,val_loader=train_loader,n_epoch=1,device=device,raytune_mode=False)
+
+    
+    
+    # print(trained_model.state_dict)
+    trained_qat_model= quantize_fx.convert_fx(trained_model)
+    
+    
+    loss_val = evaluate_model(trained_qat_model,train_loader,device,loss_fn=loss_fn)
+    
+    print(loss_val)
+    # print(trained_qat_model.state_dict)
+    
+    return trained_qat_model

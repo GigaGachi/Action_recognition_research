@@ -10,7 +10,6 @@ def find_mp4_files_in_folders(folders):
             for file in files:
                 if file.endswith('.mp4'):
                     absolute_path = os.path.join(root, file)
-                    # print(absolute_path)
                     relative_path = os.path.relpath(absolute_path, folder)
                     mp4_files.append((absolute_path, relative_path))
     return mp4_files
